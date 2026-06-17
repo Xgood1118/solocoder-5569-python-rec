@@ -23,24 +23,6 @@ class CollaborativeFiltering(ABC):
                   exclude_seen: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         pass
 
-    def _sim_func(self, idx_a: int, idx_b: int) -> float:
-        if self.similarity == 'cosine':
-            return self._cosine_sim(idx_a, idx_b)
-        elif self.similarity == 'pearson':
-            return sparse_pearson_similarity(
-                self.user_item_matrix, idx_a, idx_b, self.min_common_items
-            )
-        else:
-            raise ValueError(f"未知的相似度度量: {self.similarity}")
-
-    def _cosine_sim(self, idx_a: int, idx_b: int) -> float:
-        row_a = self.user_item_matrix.getrow(idx_a)
-        row_b = self.user_item_matrix.getrow(idx_b)
-        dot = row_a.dot(row_b.T).toarray()[0, 0]
-        norm_a = sparse.linalg.norm(row_a)
-        norm_b = sparse.linalg.norm(row_b)
-        return dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
-
 
 class UserCF(CollaborativeFiltering):
     def __init__(self, top_k: int = 50, similarity: str = 'cosine',
@@ -57,24 +39,28 @@ class UserCF(CollaborativeFiltering):
             if row.nnz > 0:
                 self.user_means[u] = row.data.mean()
 
-    def _find_neighbors(self, user_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        n_users = self.user_item_matrix.shape[0]
-        user_row = self.user_item_matrix.getrow(user_idx)
+        if self.similarity == 'cosine':
+            self.user_sim_matrix = self._compute_cosine_sim_matrix(user_item_matrix)
+        else:
+            self.user_sim_matrix = self._compute_pearson_sim_matrix(user_item_matrix)
 
-        if user_row.nnz == 0:
-            return np.array([]), np.array([])
+    def _compute_cosine_sim_matrix(self, mat: sparse.csr_matrix) -> np.ndarray:
+        norm = sparse.linalg.norm(mat, axis=1)
+        norm[norm == 0] = 1.0
+        normed = mat.multiply(1.0 / norm[:, np.newaxis])
+        sim = normed.dot(normed.T).toarray()
+        np.fill_diagonal(sim, 0.0)
+        return sim
 
-        similarities = np.zeros(n_users)
+    def _compute_pearson_sim_matrix(self, mat: sparse.csr_matrix) -> np.ndarray:
+        n_users = mat.shape[0]
+        sim = np.zeros((n_users, n_users))
         for u in range(n_users):
-            if u == user_idx:
-                continue
-            similarities[u] = self._sim_func(user_idx, u)
-
-        neighbor_indices = np.argsort(similarities)[::-1][:self.top_k]
-        neighbor_sims = similarities[neighbor_indices]
-
-        valid = neighbor_sims > 0
-        return neighbor_indices[valid], neighbor_sims[valid]
+            for v in range(u + 1, n_users):
+                s = sparse_pearson_similarity(mat, u, v, self.min_common_items)
+                sim[u, v] = s
+                sim[v, u] = s
+        return sim
 
     def recommend(self, user_idx: int, n_items: int = 10,
                   exclude_seen: bool = True) -> Tuple[np.ndarray, np.ndarray]:
@@ -82,17 +68,25 @@ class UserCF(CollaborativeFiltering):
             return np.array([]), np.array([])
 
         n_items_total = self.user_item_matrix.shape[1]
-        neighbor_indices, neighbor_sims = self._find_neighbors(user_idx)
+        user_row = self.user_item_matrix.getrow(user_idx)
+        if user_row.nnz == 0:
+            return np.array([]), np.array([])
 
-        if len(neighbor_indices) == 0:
+        sims = self.user_sim_matrix[user_idx].copy()
+        top_neighbors = np.argsort(sims)[::-1][:self.top_k]
+        neighbor_sims = sims[top_neighbors]
+        valid = neighbor_sims > 0
+        top_neighbors = top_neighbors[valid]
+        neighbor_sims = neighbor_sims[valid]
+
+        if len(top_neighbors) == 0:
             return np.array([]), np.array([])
 
         scores = np.zeros(n_items_total)
         sim_sums = np.zeros(n_items_total)
-
         user_mean = self.user_means[user_idx]
 
-        for i, neighbor_idx in enumerate(neighbor_indices):
+        for i, neighbor_idx in enumerate(top_neighbors):
             sim = neighbor_sims[i]
             neighbor_row = self.user_item_matrix.getrow(neighbor_idx)
 
@@ -108,11 +102,11 @@ class UserCF(CollaborativeFiltering):
                     scores[item_idx] += sim * rating
                     sim_sums[item_idx] += sim
 
-        valid = sim_sums > 0
-        scores[valid] = scores[valid] / sim_sums[valid]
+        valid_mask = sim_sums > 0
+        scores[valid_mask] = scores[valid_mask] / sim_sums[valid_mask]
 
         if self.similarity == 'pearson':
-            scores[valid] += user_mean
+            scores[valid_mask] += user_mean
 
         if exclude_seen:
             seen_items = self.user_item_matrix.getrow(user_idx).indices
@@ -133,40 +127,39 @@ class ItemCF(CollaborativeFiltering):
 
     def fit(self, user_item_matrix: sparse.csr_matrix):
         self.user_item_matrix = user_item_matrix
-        n_items = user_item_matrix.shape[1]
-        self.item_similarity = np.zeros((n_items, n_items))
 
-        item_item_matrix = user_item_matrix.T.tocsr()
+        if self.similarity == 'cosine':
+            self.item_similarity = self._compute_cosine_sim_matrix(user_item_matrix)
+        else:
+            self.item_similarity = self._compute_pearson_sim_matrix(user_item_matrix)
 
+    def _compute_cosine_sim_matrix(self, mat: sparse.csr_matrix) -> np.ndarray:
+        item_mat = mat.T.tocsr()
+        norm = sparse.linalg.norm(item_mat, axis=1)
+        norm[norm == 0] = 1.0
+        normed = item_mat.multiply(1.0 / norm[:, np.newaxis])
+        sim = normed.dot(normed.T).toarray()
+        np.fill_diagonal(sim, 0.0)
+        return sim
+
+    def _compute_pearson_sim_matrix(self, mat: sparse.csr_matrix) -> np.ndarray:
+        n_items = mat.shape[1]
+        sim = np.zeros((n_items, n_items))
         for i in range(n_items):
+            col_i = mat.getcol(i)
+            if col_i.nnz < self.min_common_items:
+                continue
             for j in range(i + 1, n_items):
-                if self.similarity == 'cosine':
-                    sim = self._item_cosine_sim(i, j)
-                else:
-                    sim = self._item_pearson_sim(i, j)
-                self.item_similarity[i, j] = sim
-                self.item_similarity[j, i] = sim
-
-    def _item_cosine_sim(self, item_a: int, item_b: int) -> float:
-        col_a = self.user_item_matrix.getcol(item_a)
-        col_b = self.user_item_matrix.getcol(item_b)
-        dot = col_a.T.dot(col_b).toarray()[0, 0]
-        norm_a = sparse.linalg.norm(col_a)
-        norm_b = sparse.linalg.norm(col_b)
-        return dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
-
-    def _item_pearson_sim(self, item_a: int, item_b: int) -> float:
-        col_a = self.user_item_matrix.getcol(item_a)
-        col_b = self.user_item_matrix.getcol(item_b)
-
-        common_rows = np.intersect1d(col_a.indices, col_b.indices)
-        if len(common_rows) < self.min_common_items:
-            return 0.0
-
-        vals_a = np.array([self.user_item_matrix[r, item_a] for r in common_rows])
-        vals_b = np.array([self.user_item_matrix[r, item_b] for r in common_rows])
-
-        return pearson_similarity(vals_a, vals_b)
+                col_j = mat.getcol(j)
+                common = np.intersect1d(col_i.indices, col_j.indices)
+                if len(common) < self.min_common_items:
+                    continue
+                vals_i = np.array([mat[r, i] for r in common])
+                vals_j = np.array([mat[r, j] for r in common])
+                s = pearson_similarity(vals_i, vals_j)
+                sim[i, j] = s
+                sim[j, i] = s
+        return sim
 
     def recommend(self, user_idx: int, n_items: int = 10,
                   exclude_seen: bool = True) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,13 +176,8 @@ class ItemCF(CollaborativeFiltering):
 
         for i, rated_item in enumerate(user_row.indices):
             rating = user_row.data[i]
-
-            similar_items = np.argsort(self.item_similarity[rated_item])[::-1][:self.top_k + 1]
-
-            for sim_item in similar_items:
-                if sim_item == rated_item:
-                    continue
-                scores[sim_item] += self.item_similarity[rated_item, sim_item] * rating
+            sim_row = self.item_similarity[rated_item]
+            scores += sim_row * rating
 
         if exclude_seen:
             seen_items = user_row.indices

@@ -28,7 +28,7 @@ class MultiChannelRecall:
 
     def recall(self, user_id: str, user_idx: Optional[int] = None,
                n_items: int = 50, context: Optional[Dict] = None) -> List[RecallResult]:
-        all_results: Dict[str, RecallResult] = {}
+        item_channels: Dict[str, Dict[str, Any]] = {}
 
         for channel_name, weight in self.channels.items():
             if channel_name not in self.recall_funcs:
@@ -43,25 +43,39 @@ class MultiChannelRecall:
                     score = scores[i] if i < len(scores) else 0.0
                     weighted_score = score * weight
 
-                    if item_id in all_results:
-                        if weighted_score > all_results[item_id].score:
-                            all_results[item_id].score = weighted_score
-                            all_results[item_id].channel = channel_name
+                    if item_id in item_channels:
+                        item_channels[item_id]['channels'].append(channel_name)
+                        item_channels[item_id]['scores'].append((channel_name, weighted_score))
+                        item_channels[item_id]['total_score'] += weighted_score
                     else:
-                        all_results[item_id] = RecallResult(
-                            item_id=item_id,
-                            score=weighted_score,
-                            channel=channel_name,
-                        )
+                        item_channels[item_id] = {
+                            'channels': [channel_name],
+                            'scores': [(channel_name, weighted_score)],
+                            'total_score': weighted_score,
+                            'best_channel': channel_name,
+                            'best_score': weighted_score,
+                        }
+
+                    if weighted_score > item_channels[item_id]['best_score']:
+                        item_channels[item_id]['best_channel'] = channel_name
+                        item_channels[item_id]['best_score'] = weighted_score
+
             except Exception as e:
                 print(f"召回通道 {channel_name} 执行失败: {e}")
                 continue
 
-        sorted_results = sorted(
-            all_results.values(), key=lambda x: x.score, reverse=True
-        )
+        results = []
+        for item_id, info in item_channels.items():
+            results.append(RecallResult(
+                item_id=item_id,
+                score=info['total_score'],
+                channel=','.join(info['channels']),
+                reason='',
+            ))
 
-        return sorted_results[:n_items]
+        results.sort(key=lambda x: x.score, reverse=True)
+
+        return results[:n_items]
 
     def update_channel_weights(self, weights: Dict[str, float]):
         self.channels.update(weights)

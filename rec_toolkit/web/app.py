@@ -1,5 +1,6 @@
 import os
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+import threading
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 
 from ..recommender import RecommenderSystem
@@ -13,6 +14,9 @@ def create_app(data_dir: str = 'data') -> Flask:
 
     os.makedirs(data_dir, exist_ok=True)
     rec_system = RecommenderSystem(data_dir=data_dir)
+
+    train_lock = threading.Lock()
+    train_status = {'running': False, 'progress': '', 'error': None}
 
     HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -47,8 +51,13 @@ def create_app(data_dir: str = 'data') -> Flask:
                border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500;
                transition: background 0.2s; }
         .btn:hover { background: #5a67d8; }
+        .btn:disabled { background: #a0aec0; cursor: not-allowed; }
         .btn-secondary { background: #718096; }
         .btn-secondary:hover { background: #4a5568; }
+        .btn-success { background: #48bb78; }
+        .btn-success:hover { background: #38a169; }
+        .btn-danger { background: #f56565; }
+        .btn-danger:hover { background: #e53e3e; }
         .btn-small { padding: 6px 12px; font-size: 12px; }
         .recommendation-list { list-style: none; }
         .recommendation-item { display: flex; align-items: center; padding: 12px;
@@ -72,7 +81,8 @@ def create_app(data_dir: str = 'data') -> Flask:
         .stat-value { font-size: 24px; font-weight: bold; color: #667eea; }
         .stat-label { font-size: 12px; color: #718096; margin-top: 4px; }
         .tab-bar { display: flex; gap: 4px; margin-bottom: 16px;
-                   border-bottom: 2px solid #e2e8f0; padding-bottom: 0; }
+                   border-bottom: 2px solid #e2e8f0; padding-bottom: 0;
+                   flex-wrap: wrap; }
         .tab-item { padding: 10px 20px; cursor: pointer; font-size: 14px;
                     color: #718096; border-bottom: 2px solid transparent;
                     margin-bottom: -2px; transition: all 0.2s; }
@@ -86,6 +96,7 @@ def create_app(data_dir: str = 'data') -> Flask:
         .alert { padding: 12px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
         .alert-success { background: #f0fff4; color: #22543d; border: 1px solid #9ae6b4; }
         .alert-error { background: #fff5f5; color: #742a2a; border: 1px solid #feb2b2; }
+        .alert-info { background: #ebf8ff; color: #2a4365; border: 1px solid #90cdf4; }
         .evaluation-table { width: 100%; border-collapse: collapse; font-size: 13px; }
         .evaluation-table th, .evaluation-table td {
             padding: 10px 12px; text-align: left; border-bottom: 1px solid #e2e8f0;
@@ -96,12 +107,22 @@ def create_app(data_dir: str = 'data') -> Flask:
                        cursor: pointer; transition: border-color 0.2s; }
         .upload-area:hover { border-color: #667eea; }
         .upload-area.dragover { border-color: #667eea; background: #f7fafc; }
+        .scheduler-status { background: #f7fafc; padding: 16px; border-radius: 8px; margin-bottom: 16px; }
+        .job-card { background: white; border: 1px solid #e2e8f0; border-radius: 8px;
+                    padding: 16px; margin-bottom: 12px; }
+        .job-card h4 { color: #2d3748; margin-bottom: 8px; }
+        .job-meta { font-size: 13px; color: #718096; margin-bottom: 4px; }
+        .spinner { display: inline-block; width: 16px; height: 16px;
+                   border: 2px solid #a0aec0; border-top-color: #667eea;
+                   border-radius: 50%; animation: spin 0.6s linear infinite;
+                   vertical-align: middle; margin-right: 8px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>🎬 推荐系统演示平台</h1>
-        <p>轻量级推荐系统 - 支持多算法、多路召回、冷启动、Bandit优化</p>
+        <p>轻量级推荐系统 - 支持多算法、多路召回、冷启动、Bandit优化、调度管理</p>
     </div>
 
     <div class="container">
@@ -124,6 +145,10 @@ def create_app(data_dir: str = 'data') -> Flask:
                     <div class="stat-value" id="stat-trained">-</div>
                     <div class="stat-label">训练状态</div>
                 </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="stat-scheduler">-</div>
+                    <div class="stat-label">调度器</div>
+                </div>
             </div>
         </div>
 
@@ -134,6 +159,7 @@ def create_app(data_dir: str = 'data') -> Flask:
                 <div class="tab-item" data-tab="data">数据管理</div>
                 <div class="tab-item" data-tab="config">参数配置</div>
                 <div class="tab-item" data-tab="evaluate">评估指标</div>
+                <div class="tab-item" data-tab="scheduler">调度管理</div>
             </div>
 
             <div class="tab-content active" id="tab-recommend">
@@ -231,8 +257,8 @@ def create_app(data_dir: str = 'data') -> Flask:
                     </div>
                     <div class="col">
                         <h3 style="font-size:16px; margin-bottom:12px;">数据操作</h3>
-                        <button class="btn" onclick="loadSampleData()" style="margin-right:8px;">加载示例数据</button>
-                        <button class="btn btn-secondary" onclick="retrainModel()">重新训练模型</button>
+                        <button class="btn" onclick="loadSampleData()" id="btn-sample" style="margin-right:8px;">加载示例数据</button>
+                        <button class="btn btn-secondary" onclick="retrainModel()" id="btn-retrain">重新训练模型</button>
                         <div id="action-result" style="margin-top:16px;"></div>
                     </div>
                 </div>
@@ -250,6 +276,18 @@ def create_app(data_dir: str = 'data') -> Flask:
                 <button class="btn" onclick="runEvaluation()">运行评估</button>
                 <div id="evaluation-result" style="margin-top:16px;"></div>
             </div>
+
+            <div class="tab-content" id="tab-scheduler">
+                <h3 style="font-size:16px; margin-bottom:16px;">调度管理</h3>
+                <div id="scheduler-status-container"></div>
+                <div style="margin-top:16px; display: flex; gap: 8px; flex-wrap: wrap;">
+                    <button class="btn btn-success" onclick="startScheduler()">启动调度器</button>
+                    <button class="btn btn-danger" onclick="stopScheduler()">停止调度器</button>
+                    <button class="btn" onclick="runIncrementalUpdate()">立即增量更新</button>
+                    <button class="btn btn-secondary" onclick="runRetrain()">立即全量训练</button>
+                </div>
+                <div id="scheduler-result" style="margin-top:16px;"></div>
+            </div>
         </div>
     </div>
 
@@ -261,6 +299,7 @@ def create_app(data_dir: str = 'data') -> Flask:
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             document.querySelector('[data-tab="' + tabName + '"]').classList.add('active');
             document.getElementById('tab-' + tabName).classList.add('active');
+            if (tabName === 'scheduler') loadSchedulerStatus();
         }
 
         document.querySelectorAll('.tab-item').forEach(tab => {
@@ -275,6 +314,9 @@ def create_app(data_dir: str = 'data') -> Flask:
                 document.getElementById('stat-items').textContent = data.n_items || 0;
                 document.getElementById('stat-interactions').textContent = data.n_interactions || 0;
                 document.getElementById('stat-trained').textContent = data.is_trained ? '已训练' : '未训练';
+                const sched = data.scheduler_status || {};
+                const schedRunning = Object.keys(sched).length > 0;
+                document.getElementById('stat-scheduler').textContent = schedRunning ? '运行中' : '未启动';
             } catch(e) { console.error(e); }
         }
 
@@ -387,6 +429,8 @@ def create_app(data_dir: str = 'data') -> Flask:
         }
 
         async function uploadFileData(dataType, content, mode) {
+            document.getElementById('upload-result').innerHTML =
+                '<div class="alert alert-info"><span class="spinner"></span>上传并训练中，请稍候...</div>';
             try {
                 const res = await fetch('/api/upload', {
                     method: 'POST',
@@ -399,8 +443,9 @@ def create_app(data_dir: str = 'data') -> Flask:
                 });
                 const data = await res.json();
                 document.getElementById('upload-result').innerHTML =
-                    '<div class="alert alert-success">上传成功！导入 ' + data.count + ' 条记录</div>';
+                    '<div class="alert alert-success">上传成功！导入 ' + data.count + ' 条记录，训练已在后台进行</div>';
                 loadStats();
+                pollTrainStatus();
             } catch(e) {
                 document.getElementById('upload-result').innerHTML =
                     '<div class="alert alert-error">上传失败</div>';
@@ -408,6 +453,10 @@ def create_app(data_dir: str = 'data') -> Flask:
         }
 
         async function loadSampleData() {
+            const btn = document.getElementById('btn-sample');
+            btn.disabled = true;
+            document.getElementById('action-result').innerHTML =
+                '<div class="alert alert-info"><span class="spinner"></span>加载示例数据并训练中...</div>';
             try {
                 const res = await fetch('/api/sample', { method: 'POST' });
                 const data = await res.json();
@@ -415,23 +464,46 @@ def create_app(data_dir: str = 'data') -> Flask:
                     '<div class="alert alert-success">' + data.message + '</div>';
                 loadStats();
                 loadChannelWeights();
+                pollTrainStatus();
             } catch(e) {
                 document.getElementById('action-result').innerHTML =
                     '<div class="alert alert-error">加载失败</div>';
+            } finally {
+                btn.disabled = false;
             }
         }
 
         async function retrainModel() {
+            const btn = document.getElementById('btn-retrain');
+            btn.disabled = true;
+            document.getElementById('action-result').innerHTML =
+                '<div class="alert alert-info"><span class="spinner"></span>模型训练中...</div>';
             try {
                 const res = await fetch('/api/retrain', { method: 'POST' });
                 const data = await res.json();
                 document.getElementById('action-result').innerHTML =
-                    '<div class="alert alert-success">模型训练完成！</div>';
+                    '<div class="alert alert-success">' + (data.message || '训练完成') + '</div>';
                 loadStats();
+                if (!data.background) pollTrainStatus();
             } catch(e) {
                 document.getElementById('action-result').innerHTML =
                     '<div class="alert alert-error">训练失败</div>';
+            } finally {
+                btn.disabled = false;
             }
+        }
+
+        async function pollTrainStatus() {
+            try {
+                const res = await fetch('/api/train/status');
+                const data = await res.json();
+                if (data.running) {
+                    setTimeout(pollTrainStatus, 2000);
+                } else {
+                    loadStats();
+                    loadChannelWeights();
+                }
+            } catch(e) { console.error(e); }
         }
 
         async function loadChannelWeights() {
@@ -520,12 +592,118 @@ def create_app(data_dir: str = 'data') -> Flask:
             container.innerHTML = html;
         }
 
+        async function loadSchedulerStatus() {
+            try {
+                const res = await fetch('/api/scheduler/status');
+                const data = await res.json();
+                renderSchedulerStatus(data);
+            } catch(e) {
+                document.getElementById('scheduler-status-container').innerHTML =
+                    '<div class="alert alert-error">获取调度器状态失败</div>';
+            }
+        }
+
+        function renderSchedulerStatus(data) {
+            const container = document.getElementById('scheduler-status-container');
+            const jobs = data.jobs || {};
+
+            if (Object.keys(jobs).length === 0) {
+                container.innerHTML = '<div class="alert alert-info">调度器未启动，请点击"启动调度器"</div>';
+                return;
+            }
+
+            let html = '';
+            for (const [jobId, info] of Object.entries(jobs)) {
+                html += `
+                    <div class="job-card">
+                        <h4>${jobId}</h4>
+                        <div class="job-meta">Cron: ${info.cron_expr || '-'}</div>
+                        <div class="job-meta">间隔: ${info.interval_seconds ? info.interval_seconds + '秒' : '-'}</div>
+                        <div class="job-meta">上次运行: ${info.last_run || '从未运行'}</div>
+                        <div class="job-meta">下次运行: ${info.next_run || '-'}</div>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+        }
+
+        async function startScheduler() {
+            try {
+                await fetch('/api/scheduler/start', { method: 'POST' });
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-success">调度器已启动</div>';
+                loadSchedulerStatus();
+                loadStats();
+            } catch(e) {
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-error">启动失败</div>';
+            }
+        }
+
+        async function stopScheduler() {
+            try {
+                await fetch('/api/scheduler/stop', { method: 'POST' });
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-success">调度器已停止</div>';
+                loadSchedulerStatus();
+                loadStats();
+            } catch(e) {
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-error">停止失败</div>';
+            }
+        }
+
+        async function runIncrementalUpdate() {
+            document.getElementById('scheduler-result').innerHTML =
+                '<div class="alert alert-info"><span class="spinner"></span>增量更新中...</div>';
+            try {
+                const res = await fetch('/api/scheduler/incremental', { method: 'POST' });
+                const data = await res.json();
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-success">' + (data.message || '增量更新完成') + '</div>';
+                loadStats();
+                loadSchedulerStatus();
+            } catch(e) {
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-error">增量更新失败</div>';
+            }
+        }
+
+        async function runRetrain() {
+            document.getElementById('scheduler-result').innerHTML =
+                '<div class="alert alert-info"><span class="spinner"></span>全量训练中...</div>';
+            try {
+                const res = await fetch('/api/scheduler/retrain', { method: 'POST' });
+                const data = await res.json();
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-success">' + (data.message || '全量训练完成') + '</div>';
+                loadStats();
+                loadSchedulerStatus();
+            } catch(e) {
+                document.getElementById('scheduler-result').innerHTML =
+                    '<div class="alert alert-error">全量训练失败</div>';
+            }
+        }
+
         loadStats();
         loadChannelWeights();
     </script>
 </body>
 </html>
     """
+
+    def _background_train(task_name):
+        with train_lock:
+            train_status['running'] = True
+            train_status['progress'] = task_name
+            train_status['error'] = None
+        try:
+            rec_system.train_all()
+        except Exception as e:
+            train_status['error'] = str(e)
+        finally:
+            train_status['running'] = False
+            train_status['progress'] = ''
 
     @app.route('/')
     def index():
@@ -534,6 +712,10 @@ def create_app(data_dir: str = 'data') -> Flask:
     @app.route('/api/stats')
     def api_stats():
         return jsonify(rec_system.get_stats())
+
+    @app.route('/api/train/status')
+    def api_train_status():
+        return jsonify(train_status)
 
     @app.route('/api/recommend')
     def api_recommend():
@@ -581,7 +763,9 @@ def create_app(data_dir: str = 'data') -> Flask:
         count = loader.upload_file(data_type, content, mode=mode)
 
         rec_system.load_data()
-        rec_system.train_all()
+
+        t = threading.Thread(target=_background_train, args=('upload_train',), daemon=True)
+        t.start()
 
         return jsonify({'success': True, 'count': count})
 
@@ -589,13 +773,21 @@ def create_app(data_dir: str = 'data') -> Flask:
     def api_sample():
         _generate_sample_data(rec_system.data_dir)
         rec_system.load_data()
-        rec_system.train_all()
-        return jsonify({'success': True, 'message': '示例数据加载并训练完成'})
+
+        t = threading.Thread(target=_background_train, args=('sample_train',), daemon=True)
+        t.start()
+
+        return jsonify({'success': True, 'message': '示例数据已加载，训练在后台进行'})
 
     @app.route('/api/retrain', methods=['POST'])
     def api_retrain():
-        rec_system.retrain()
-        return jsonify({'success': True})
+        if train_status['running']:
+            return jsonify({'success': False, 'message': '训练正在进行中'})
+
+        t = threading.Thread(target=_background_train, args=('retrain',), daemon=True)
+        t.start()
+
+        return jsonify({'success': True, 'message': '训练已在后台启动', 'background': True})
 
     @app.route('/api/feedback', methods=['POST'])
     def api_feedback():
@@ -675,12 +867,42 @@ def create_app(data_dir: str = 'data') -> Flask:
             'items': items,
         })
 
+    @app.route('/api/scheduler/status')
+    def api_scheduler_status():
+        status = rec_system.get_scheduler_status()
+        return jsonify({'jobs': status})
+
+    @app.route('/api/scheduler/start', methods=['POST'])
+    def api_scheduler_start():
+        rec_system.start_scheduler()
+        return jsonify({'success': True, 'message': '调度器已启动'})
+
+    @app.route('/api/scheduler/stop', methods=['POST'])
+    def api_scheduler_stop():
+        rec_system.stop_scheduler()
+        return jsonify({'success': True, 'message': '调度器已停止'})
+
+    @app.route('/api/scheduler/incremental', methods=['POST'])
+    def api_scheduler_incremental():
+        if rec_system.scheduler and 'incremental_update' in rec_system.scheduler.jobs:
+            rec_system.scheduler.run_now('incremental_update')
+            return jsonify({'success': True, 'message': '增量更新已执行'})
+        return jsonify({'success': False, 'message': '调度器未初始化'})
+
+    @app.route('/api/scheduler/retrain', methods=['POST'])
+    def api_scheduler_retrain():
+        if rec_system.scheduler and 'retrain' in rec_system.scheduler.jobs:
+            rec_system.scheduler.run_now('retrain')
+            return jsonify({'success': True, 'message': '全量训练已执行'})
+        return jsonify({'success': False, 'message': '调度器未初始化'})
+
     return app
 
 
 def _generate_sample_data(data_dir: str):
     import pandas as pd
-    import os
+    import numpy as np
+    from datetime import datetime, timedelta
 
     os.makedirs(data_dir, exist_ok=True)
 
@@ -712,7 +934,6 @@ def _generate_sample_data(data_dir: str):
         })
     pd.DataFrame(items_data).to_csv(os.path.join(data_dir, 'items.csv'), index=False)
 
-    import numpy as np
     np.random.seed(42)
     interactions_data = []
     for i in range(1000):
@@ -720,7 +941,6 @@ def _generate_sample_data(data_dir: str):
         item_idx = np.random.randint(1, 101)
         rating = round(3 + np.random.rand() * 2, 1)
         days_ago = np.random.randint(0, 90)
-        from datetime import datetime, timedelta
         ts = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d %H:%M:%S')
         interactions_data.append({
             'user_id': f'user_{user_idx}',
@@ -732,8 +952,14 @@ def _generate_sample_data(data_dir: str):
     pd.DataFrame(interactions_data).to_csv(os.path.join(data_dir, 'interactions.csv'), index=False)
 
 
-def run_server(host: str = '0.0.0.0', port: int = 5000, debug: bool = True,
+def run_server(host: str = None, port: int = None, debug: bool = None,
                data_dir: str = 'data'):
+    server_config = config.get('server', {})
+    host = host or server_config.get('host', '0.0.0.0')
+    port = port or server_config.get('port', 5000)
+    if debug is None:
+        debug = server_config.get('debug', True)
+
     app = create_app(data_dir=data_dir)
     app.run(host=host, port=port, debug=debug)
 

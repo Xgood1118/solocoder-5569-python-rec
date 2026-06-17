@@ -19,6 +19,7 @@ from .association import AssociationRuleMiner
 from .bandit import BanditWeightOptimizer
 from .ab_test import ABTestManager
 from .explanation import ReasonGenerator
+from .scheduler import Scheduler, IncrementalUpdater
 
 
 @dataclass
@@ -52,6 +53,9 @@ class RecommenderSystem:
         self.bandit_optimizer: Optional[BanditWeightOptimizer] = None
         self.ab_test: Optional[ABTestManager] = None
         self.reason_generator: Optional[ReasonGenerator] = None
+
+        self.scheduler: Optional[Scheduler] = None
+        self.incremental_updater: Optional[IncrementalUpdater] = None
 
         self.is_trained = False
 
@@ -156,6 +160,8 @@ class RecommenderSystem:
 
         self.reason_generator = ReasonGenerator()
 
+        self._setup_scheduler()
+
         self.is_trained = True
 
     def _setup_recall(self):
@@ -175,6 +181,22 @@ class RecommenderSystem:
                                             self._popular_recall)
         self.multi_recall.register_channel('svd', recall_config['channels'].get('svd', 0),
                                             self._svd_recall)
+
+    def _setup_scheduler(self):
+        self.scheduler = Scheduler()
+        self.incremental_updater = IncrementalUpdater(self)
+
+        sched_config = config['scheduler']
+        self.scheduler.add_job(
+            'incremental_update',
+            self.incremental_updater.update,
+            interval_seconds=sched_config['incremental_interval'],
+        )
+        self.scheduler.add_job(
+            'retrain',
+            self.incremental_updater.retrain,
+            cron_expr=sched_config['retrain_cron'],
+        )
 
     def _user_cf_recall(self, user_id: str, user_idx=None, n_items=50, context=None):
         if not self.user_cf or user_idx is None:
@@ -265,15 +287,21 @@ class RecommenderSystem:
 
         results = []
         for i, r in enumerate(top_ranked):
-            reason = self.reason_generator.generate_reason(
-                r.channels[0] if r.channels else 'popular',
-                context={'item_id': r.item_id}
-            )
+            channels = r.channels if r.channels else ['popular']
+            reasons = []
+            for ch in channels:
+                reason = self.reason_generator.generate_reason(
+                    ch,
+                    context={'item_id': r.item_id, 'user_id': user_id}
+                )
+                reasons.append(reason)
+            combined_reason = ' + '.join(reasons) if len(reasons) > 1 else (reasons[0] if reasons else '')
+
             results.append(RecommendationItem(
                 item_id=r.item_id,
                 score=r.final_score,
-                reason=reason,
-                channel=r.channels[0] if r.channels else '',
+                reason=combined_reason,
+                channel=','.join(channels),
                 rank=i + 1,
             ))
 
@@ -284,8 +312,13 @@ class RecommenderSystem:
         user_profile = self.user_profile_builder.get_profile(user_id) if self.user_profile_builder else None
         popular_items = self.popular_rec.get_popular_items(n_items * 2) if self.popular_rec else []
 
+        item_profiles = None
+        if self.item_profile_builder:
+            item_profiles = {p.item_id: p for p in self.item_profile_builder.get_all_items()}
+
         item_ids, reasons = self.cold_start.handle_new_user(
-            user_profile, popular_items, self.content_rec, n_items
+            user_profile, popular_items, self.content_rec, n_items,
+            item_profiles=item_profiles
         )
 
         results = []
@@ -321,8 +354,31 @@ class RecommenderSystem:
         return results[:n]
 
     def incremental_update(self):
-        if self.svd:
-            pass
+        if not self.is_trained:
+            return
+
+        self.dataset.load_all()
+
+        if self.svd and self.dataset.user_item_matrix is not None:
+            rows, cols, ratings = [], [], []
+            for _, row in self.dataset.interactions.iterrows():
+                uid = str(row['user_id'])
+                iid = str(row['item_id'])
+                if uid in self.dataset.user2idx and iid in self.dataset.item2idx:
+                    rows.append(self.dataset.user2idx[uid])
+                    cols.append(self.dataset.item2idx[iid])
+                    ratings.append(float(row.get('rating', 1.0)))
+
+            new_interactions = list(zip(rows, cols, ratings))
+            self.svd.incremental_update(new_interactions)
+
+        if self.popular_rec:
+            self.popular_rec.fit(self.dataset.interactions, self.dataset.items)
+
+        if self.user_profile_builder:
+            self.user_profile_builder.build_all()
+        if self.item_profile_builder:
+            self.item_profile_builder.build_all()
 
     def retrain(self):
         self.load_data()
@@ -358,6 +414,19 @@ class RecommenderSystem:
             item_categories=item_categories
         )
 
+    def start_scheduler(self):
+        if self.scheduler:
+            self.scheduler.start()
+
+    def stop_scheduler(self):
+        if self.scheduler:
+            self.scheduler.stop()
+
+    def get_scheduler_status(self) -> dict:
+        if self.scheduler:
+            return self.scheduler.get_job_status()
+        return {}
+
     def get_stats(self) -> Dict[str, Any]:
         return {
             'n_users': self.dataset.n_users,
@@ -366,4 +435,5 @@ class RecommenderSystem:
             'is_trained': self.is_trained,
             'recall_channels': list(self.multi_recall.channels.keys()) if self.multi_recall else [],
             'bandit_weights': self.bandit_optimizer.get_weights() if self.bandit_optimizer else {},
+            'scheduler_status': self.get_scheduler_status(),
         }

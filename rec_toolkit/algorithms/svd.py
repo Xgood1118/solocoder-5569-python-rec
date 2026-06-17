@@ -32,31 +32,41 @@ class SVDRecommender:
         self.item_bias = np.zeros(self.n_items)
 
         rows, cols, ratings = sparse.find(user_item_matrix)
+        n_ratings = len(ratings)
+        if n_ratings == 0:
+            return
+
+        rows = rows.astype(np.intp)
+        cols = cols.astype(np.intp)
+        ratings = ratings.astype(np.float64)
 
         for epoch in range(self.n_epochs):
-            for idx in range(len(ratings)):
-                u = rows[idx]
-                i = cols[idx]
-                r = ratings[idx]
+            perm = np.random.permutation(n_ratings)
+            r_rows = rows[perm]
+            r_cols = cols[perm]
+            r_vals = ratings[perm]
 
-                pred = self._predict_single(u, i)
-                error = r - pred
+            u_f = self.user_factors[r_rows]
+            i_f = self.item_factors[r_cols]
+            u_b = self.user_bias[r_rows]
+            i_b = self.item_bias[r_cols]
 
-                self.user_bias[u] += self.lr_all * (error - self.reg_all * self.user_bias[u])
-                self.item_bias[i] += self.lr_all * (error - self.reg_all * self.item_bias[i])
+            preds = self.global_mean + u_b + i_b + np.sum(u_f * i_f, axis=1)
+            errors = r_vals - preds
 
-                uf = self.user_factors[u].copy()
-                self.user_factors[u] += self.lr_all * (
-                    error * self.item_factors[i] - self.reg_all * self.user_factors[u]
-                )
-                self.item_factors[i] += self.lr_all * (
-                    error * uf - self.reg_all * self.item_factors[i]
-                )
+            self.user_bias[r_rows] += self.lr_all * (errors - self.reg_all * u_b)
+            self.item_bias[r_cols] += self.lr_all * (errors - self.reg_all * i_b)
+
+            u_f_grad = errors[:, np.newaxis] * i_f - self.reg_all * u_f
+            i_f_grad = errors[:, np.newaxis] * u_f - self.reg_all * i_f
+
+            np.add.at(self.user_factors, r_rows, self.lr_all * u_f_grad)
+            np.add.at(self.item_factors, r_cols, self.lr_all * i_f_grad)
 
     def _compute_global_mean(self, user_item_matrix: sparse.csr_matrix) -> float:
         if user_item_matrix.nnz == 0:
             return 0.0
-        return user_item_matrix.data.mean()
+        return float(user_item_matrix.data.mean())
 
     def _predict_single(self, user_idx: int, item_idx: int) -> float:
         pred = self.global_mean + self.user_bias[user_idx] + self.item_bias[item_idx]
@@ -68,8 +78,12 @@ class SVDRecommender:
             return
 
         for user_id, item_id, rating in new_interactions:
-            u = user_id if isinstance(user_id, int) else 0
-            i = item_id if isinstance(item_id, int) else 0
+            if isinstance(user_id, str):
+                continue
+            if isinstance(item_id, str):
+                continue
+            u = int(user_id)
+            i = int(item_id)
 
             if u >= self.n_users or i >= self.n_items:
                 continue
@@ -87,28 +101,6 @@ class SVDRecommender:
             self.item_factors[i] += self.lr_all * (
                 error * uf - self.reg_all * self.item_factors[i]
             )
-
-    def add_user(self, user_idx: int):
-        if self.user_factors is None:
-            return
-
-        if user_idx >= self.n_users:
-            new_factors = np.random.normal(0, 0.1, (user_idx - self.n_users + 1, self.n_factors))
-            new_bias = np.zeros(user_idx - self.n_users + 1)
-            self.user_factors = np.vstack([self.user_factors, new_factors])
-            self.user_bias = np.concatenate([self.user_bias, new_bias])
-            self.n_users = user_idx + 1
-
-    def add_item(self, item_idx: int):
-        if self.item_factors is None:
-            return
-
-        if item_idx >= self.n_items:
-            new_factors = np.random.normal(0, 0.1, (item_idx - self.n_items + 1, self.n_factors))
-            new_bias = np.zeros(item_idx - self.n_items + 1)
-            self.item_factors = np.vstack([self.item_factors, new_factors])
-            self.item_bias = np.concatenate([self.item_bias, new_bias])
-            self.n_items = item_idx + 1
 
     def recommend(self, user_idx: int, n_items: int = 10,
                   exclude_seen: bool = True,
