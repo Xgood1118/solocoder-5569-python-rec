@@ -4,7 +4,7 @@ from typing import Tuple, Optional
 
 
 class ALSRecommender:
-    def __init__(self, n_factors: int = 100, n_epochs: int = 20,
+    def __init__(self, n_factors: int = 100, n_epochs: int = 5,
                  reg: float = 0.1, alpha: float = 40, implicit: bool = True):
         self.n_factors = n_factors
         self.n_epochs = n_epochs
@@ -30,9 +30,10 @@ class ALSRecommender:
             self._fit_explicit(user_item_matrix)
 
     def _fit_explicit(self, user_item_matrix: sparse.csr_matrix):
+        item_user_matrix = user_item_matrix.T.tocsr()
         for epoch in range(self.n_epochs):
             self._als_step_users_explicit(user_item_matrix)
-            self._als_step_items_explicit(user_item_matrix)
+            self._als_step_items_explicit(item_user_matrix)
 
     def _als_step_users_explicit(self, user_item_matrix: sparse.csr_matrix):
         YtY = self.item_factors.T @ self.item_factors
@@ -52,17 +53,17 @@ class ALSRecommender:
                 Y_u.T @ ratings
             )
 
-    def _als_step_items_explicit(self, user_item_matrix: sparse.csr_matrix):
+    def _als_step_items_explicit(self, item_user_matrix: sparse.csr_matrix):
         XtX = self.user_factors.T @ self.user_factors
         reg_I = self.reg * np.eye(self.n_factors)
 
         for i in range(self.n_items):
-            col = user_item_matrix.getcol(i)
-            if col.nnz == 0:
+            row = item_user_matrix.getrow(i)
+            if row.nnz == 0:
                 continue
 
-            indices = col.indices
-            ratings = col.data
+            indices = row.indices
+            ratings = row.data
 
             X_i = self.user_factors[indices]
             self.item_factors[i] = np.linalg.solve(
@@ -71,9 +72,10 @@ class ALSRecommender:
             )
 
     def _fit_implicit(self, user_item_matrix: sparse.csr_matrix):
+        item_user_matrix = user_item_matrix.T.tocsr()
         for epoch in range(self.n_epochs):
             self._als_step_users_implicit(user_item_matrix)
-            self._als_step_items_implicit(user_item_matrix)
+            self._als_step_items_implicit(item_user_matrix)
 
     def _als_step_users_implicit(self, user_item_matrix: sparse.csr_matrix):
         YtY = self.item_factors.T @ self.item_factors
@@ -87,47 +89,33 @@ class ALSRecommender:
                 self.user_factors[u] = np.zeros(self.n_factors)
                 continue
 
-            p_u = np.where(row.toarray().flatten() > 0, 1.0, 0.0)
-            c_u = 1.0 + self.alpha * row.toarray().flatten()
+            cu_values = 1.0 + self.alpha * row.data
+            cu_minus_1 = cu_values - 1.0
 
-            Y_Cu_Y = YtY.copy()
-            Y_Cu_pu = np.zeros(self.n_factors)
-
-            for i in indices:
-                cu_i = c_u[i]
-                yi = self.item_factors[i]
-                Y_Cu_Y += (cu_i - 1.0) * np.outer(yi, yi)
-                Y_Cu_pu += cu_i * p_u[i] * yi
+            Y_indices = self.item_factors[indices]
+            Y_Cu_Y = YtY + Y_indices.T @ (cu_minus_1[:, np.newaxis] * Y_indices)
+            Y_Cu_pu = Y_indices.T @ cu_values
 
             self.user_factors[u] = np.linalg.solve(Y_Cu_Y + reg_I, Y_Cu_pu)
 
-    def _als_step_items_implicit(self, user_item_matrix: sparse.csr_matrix):
+    def _als_step_items_implicit(self, item_user_matrix: sparse.csr_matrix):
         XtX = self.user_factors.T @ self.user_factors
         reg_I = self.reg * np.eye(self.n_factors)
 
         for i in range(self.n_items):
-            col = user_item_matrix.getcol(i)
-            indices = col.indices
+            row = item_user_matrix.getrow(i)
+            indices = row.indices
 
             if len(indices) == 0:
                 self.item_factors[i] = np.zeros(self.n_factors)
                 continue
 
-            p_i = np.zeros(self.n_users)
-            c_i = np.ones(self.n_users)
-            for u in indices:
-                rating = user_item_matrix[u, i]
-                p_i[u] = 1.0 if rating > 0 else 0.0
-                c_i[u] = 1.0 + self.alpha * rating
+            ci_values = 1.0 + self.alpha * row.data
+            ci_minus_1 = ci_values - 1.0
 
-            X_Ci_X = XtX.copy()
-            X_Ci_pi = np.zeros(self.n_factors)
-
-            for u in indices:
-                ci_u = c_i[u]
-                xu = self.user_factors[u]
-                X_Ci_X += (ci_u - 1.0) * np.outer(xu, xu)
-                X_Ci_pi += ci_u * p_i[u] * xu
+            X_indices = self.user_factors[indices]
+            X_Ci_X = XtX + X_indices.T @ (ci_minus_1[:, np.newaxis] * X_indices)
+            X_Ci_pi = X_indices.T @ ci_values
 
             self.item_factors[i] = np.linalg.solve(X_Ci_X + reg_I, X_Ci_pi)
 

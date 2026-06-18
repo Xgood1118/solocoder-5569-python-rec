@@ -20,86 +20,128 @@ class ColdStartHandler:
         item_ids = []
         reasons = []
 
+        def _match_by_interests(interests: List[str], exclude: List[str], n: int) -> Tuple[List[str], List[str]]:
+            matched = []
+            matched_reasons = []
+            used_items = set(exclude)
+
+            for interest in interests:
+                if len(matched) >= n:
+                    break
+                interest_lower = interest.lower()
+                for item_id, profile in (item_profiles or {}).items():
+                    if len(matched) >= n:
+                        break
+                    if item_id in used_items:
+                        continue
+                    hit = False
+                    hit_field = ''
+                    if profile.category and interest_lower in str(profile.category).lower():
+                        hit = True
+                        hit_field = f'分类「{profile.category}」'
+                    if not hit:
+                        for tag in profile.tags or []:
+                            if interest_lower in str(tag).lower():
+                                hit = True
+                                hit_field = f'标签「{tag}」'
+                                break
+                    if hit:
+                        matched.append(item_id)
+                        used_items.add(item_id)
+                        matched_reasons.append(f'根据你感兴趣的「{interest}」{hit_field}推荐')
+
+            return matched, matched_reasons
+
+        def _gen_interest_reason(interests: List[str]) -> str:
+            if interests:
+                preview = '、'.join(interests[:2])
+                if len(interests) > 2:
+                    preview += '等'
+                return f'新人专享：匹配你的兴趣「{preview}」'
+            return '新人专享推荐'
+
         if self.config.new_user_strategy == 'popular_then_interest':
             n_popular = int(n_items * 0.6)
             n_interest = n_items - n_popular
 
             popular_part = popular_items[:n_popular]
             item_ids.extend(popular_part)
-            for pid in popular_part:
-                if item_profiles and pid in item_profiles:
-                    p = item_profiles[pid]
-                    cat = getattr(p, 'category', None) or ''
-                    title = getattr(p, 'title', None) or ''
-                    if title:
-                        reasons.append(f'全网热门：{title}')
-                    elif cat:
-                        reasons.append(f'热门{cat}')
-                    else:
-                        reasons.append('全网热门')
-                else:
-                    reasons.append('全网热门')
+            reasons.extend(['全网热门'] * len(popular_part))
 
-            if content_recommender is not None and hasattr(user_profile, 'interests') and user_profile.interests:
+            interest_items = []
+            interest_reasons = []
+
+            if content_recommender is not None and user_profile.interests:
                 interest_items, _ = content_recommender.recommend(
                     user_profile, n_interest, exclude_items=item_ids
                 )
-                for iid in interest_items:
-                    item_ids.append(iid)
-                    interest_label = user_profile.interests[0] if user_profile.interests else ''
-                    if item_profiles and iid in item_profiles:
-                        p = item_profiles[iid]
-                        title = getattr(p, 'title', None) or ''
-                        cat = getattr(p, 'category', None) or ''
-                        if title:
-                            reasons.append(f'因为你对「{interest_label}」感兴趣 → {title}')
-                        elif cat:
-                            reasons.append(f'兴趣匹配{cat}：{interest_label}')
+                if interest_items:
+                    for iid in interest_items:
+                        matched_interest = None
+                        for interest in user_profile.interests:
+                            profile = item_profiles.get(iid) if item_profiles else None
+                            if profile:
+                                if profile.category and interest.lower() in str(profile.category).lower():
+                                    matched_interest = interest
+                                    break
+                                for tag in profile.tags or []:
+                                    if interest.lower() in str(tag).lower():
+                                        matched_interest = interest
+                                        break
+                        if matched_interest:
+                            interest_reasons.append(f'根据你感兴趣的「{matched_interest}」推荐')
                         else:
-                            reasons.append(f'兴趣匹配：{interest_label}')
-                    else:
-                        reasons.append(f'兴趣匹配：{interest_label}')
+                            interest_reasons.append(_gen_interest_reason(user_profile.interests))
+
+            if len(interest_items) < n_interest and user_profile.interests and item_profiles:
+                remaining_need = n_interest - len(interest_items)
+                extra_items, extra_reasons = _match_by_interests(
+                    user_profile.interests,
+                    exclude=item_ids + interest_items,
+                    n=remaining_need
+                )
+                interest_items.extend(extra_items)
+                interest_reasons.extend(extra_reasons)
+
+            if len(interest_items) < n_interest and user_profile.interests:
+                remaining_need = n_interest - len(interest_items)
+                extra_popular = [p for p in popular_items if p not in item_ids and p not in interest_items]
+                interest_items.extend(extra_popular[:remaining_need])
+                interest_reasons.extend([_gen_interest_reason(user_profile.interests)] * min(remaining_need, len(extra_popular)))
+
+            item_ids.extend(interest_items)
+            reasons.extend(interest_reasons)
 
             remaining = n_items - len(item_ids)
-            if remaining > 0 and len(popular_items) > n_popular:
-                extra = popular_items[n_popular:n_popular + remaining]
-                for pid in extra:
-                    item_ids.append(pid)
-                    if item_profiles and pid in item_profiles:
-                        p = item_profiles[pid]
-                        title = getattr(p, 'title', None) or ''
-                        if title:
-                            reasons.append(f'热门推荐：{title}')
-                        else:
-                            reasons.append('热门推荐')
-                    else:
-                        reasons.append('热门推荐')
+            if remaining > 0:
+                extra_popular = [p for p in popular_items if p not in item_ids]
+                extra = extra_popular[:remaining]
+                item_ids.extend(extra)
+                reasons.extend(['全网热门'] * len(extra))
 
         elif self.config.new_user_strategy == 'popular_only':
             item_ids = popular_items[:n_items]
-            for pid in item_ids:
-                if item_profiles and pid in item_profiles:
-                    p = item_profiles[pid]
-                    title = getattr(p, 'title', None) or ''
-                    reasons.append(f'全网热门：{title}' if title else '全网热门')
-                else:
-                    reasons.append('全网热门')
+            reasons = ['全网热门'] * len(item_ids)
 
         elif self.config.new_user_strategy == 'interest_only':
-            if content_recommender is not None and hasattr(user_profile, 'interests') and user_profile.interests:
-                interest_items, _ = content_recommender.recommend(user_profile, n_items)
-                for iid in interest_items:
-                    item_ids.append(iid)
-                    interest_label = user_profile.interests[0] if user_profile.interests else ''
-                    if item_profiles and iid in item_profiles:
-                        p = item_profiles[iid]
-                        title = getattr(p, 'title', None) or ''
-                        reasons.append(f'兴趣推荐：{title}' if title else f'兴趣匹配：{interest_label}')
-                    else:
-                        reasons.append(f'兴趣匹配：{interest_label}')
-            else:
-                item_ids = popular_items[:n_items]
-                reasons = ['全网热门'] * len(item_ids)
+            if content_recommender is not None and user_profile.interests:
+                item_ids, _ = content_recommender.recommend(user_profile, n_items)
+                reasons = [_gen_interest_reason(user_profile.interests)] * len(item_ids)
+            if len(item_ids) < n_items and user_profile.interests and item_profiles:
+                remaining_need = n_items - len(item_ids)
+                extra_items, extra_reasons = _match_by_interests(
+                    user_profile.interests,
+                    exclude=item_ids,
+                    n=remaining_need
+                )
+                item_ids.extend(extra_items)
+                reasons.extend(extra_reasons)
+            if len(item_ids) < n_items:
+                remaining_need = n_items - len(item_ids)
+                extra_popular = [p for p in popular_items if p not in item_ids]
+                item_ids.extend(extra_popular[:remaining_need])
+                tag = '全网热门' if not user_profile.interests else _gen_interest_reason(user_profile.interests)
+                reasons.extend([tag] * min(remaining_need, len(extra_popular)))
 
         return item_ids[:n_items], reasons[:n_items]
 

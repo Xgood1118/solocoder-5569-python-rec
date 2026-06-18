@@ -3,7 +3,6 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 import os
-from collections import defaultdict
 
 
 @dataclass
@@ -58,8 +57,6 @@ class AssociationRuleMiner:
         k = 2
         while current_itemsets:
             candidates = self._apriori_gen(list(current_itemsets.keys()), k)
-            if not candidates:
-                break
             candidate_counts = {c: 0 for c in candidates}
 
             for trans in transactions:
@@ -92,8 +89,9 @@ class AssociationRuleMiner:
 
                 if list1[:-1] == list2[:-1]:
                     candidate = itemset1 | itemset2
-                    if not self._has_infrequent_subset(candidate, itemsets, k):
-                        candidates.append(candidate)
+                    if self._has_infrequent_subset(candidate, itemsets, k):
+                        continue
+                    candidates.append(candidate)
 
         return candidates
 
@@ -107,10 +105,10 @@ class AssociationRuleMiner:
     def _fpgrowth(self, transactions: List[List[str]]):
         n_transactions = len(transactions)
 
-        item_counts: Dict[str, int] = defaultdict(int)
+        item_counts = {}
         for trans in transactions:
-            for item in set(trans):
-                item_counts[item] += 1
+            for item in trans:
+                item_counts[item] = item_counts.get(item, 0) + 1
 
         frequent_items = {
             item: count / n_transactions
@@ -121,104 +119,53 @@ class AssociationRuleMiner:
         for item, support in frequent_items.items():
             self.itemsets[frozenset([item])] = support
 
-        header_table: Dict[str, Dict] = {}
-        for item, support in frequent_items.items():
-            header_table[item] = {'support': support, 'count': item_counts[item], 'nodes': []}
-
-        sorted_items = sorted(frequent_items.keys(), key=lambda x: frequent_items[x])
-
-        root = {'item': None, 'count': 0, 'children': {}, 'parent': None}
-
+        sorted_transactions = []
         for trans in transactions:
             filtered = [item for item in trans if item in frequent_items]
             filtered.sort(key=lambda x: frequent_items[x], reverse=True)
-            self._insert_fp_tree(filtered, root, header_table)
+            sorted_transactions.append(filtered)
 
-        self._mine_fp_tree(root, header_table, frozenset(), n_transactions, sorted_items)
+        tree_root = {'children': {}, 'count': 0}
 
-    def _insert_fp_tree(self, items: List[str], node: dict, header_table: dict):
-        current = node
-        for item in items:
-            if item in current['children']:
-                current['children'][item]['count'] += 1
-            else:
-                new_node = {'item': item, 'count': 1, 'children': {}, 'parent': current}
-                current['children'][item] = new_node
-                if item in header_table:
-                    header_table[item]['nodes'].append(new_node)
-            current = current['children'][item]
+        for trans in sorted_transactions:
+            if trans:
+                self._insert_tree(trans, tree_root)
 
-    def _mine_fp_tree(self, root: dict, header_table: dict, prefix: frozenset,
-                      n_transactions: int, sorted_items: list):
-        for item in sorted_items:
-            new_prefix = prefix | frozenset([item])
-            prefix_count = header_table[item]['count']
-            prefix_support = prefix_count / n_transactions
+        self._mine_tree(tree_root, set(), transactions)
 
-            if prefix_support >= self.min_support:
-                self.itemsets[new_prefix] = prefix_support
+    def _insert_tree(self, items: List[str], node: dict):
+        if not items:
+            return
 
-            conditional_patterns = self._get_conditional_patterns(item, header_table)
+        first = items[0]
+        if first in node['children']:
+            node['children'][first]['count'] += 1
+        else:
+            node['children'][first] = {'children': {}, 'count': 1}
 
-            if conditional_patterns:
-                cond_header, cond_n = self._build_conditional_tree(
-                    conditional_patterns, n_transactions
-                )
+        self._insert_tree(items[1:], node['children'][first])
 
-                if cond_header:
-                    cond_sorted = sorted(
-                        cond_header.keys(),
-                        key=lambda x: cond_header[x]['support']
-                    )
-                    self._mine_fp_tree(
-                        {'item': None, 'count': 0, 'children': {}, 'parent': None},
-                        cond_header, new_prefix, n_transactions, cond_sorted
-                    )
+    def _mine_tree(self, tree, prefix: set, transactions: List[List[str]]):
+        n_transactions = len(transactions)
+        frequent_single = [list(s)[0] for s in self.itemsets.keys() if len(s) == 1]
 
-    def _get_conditional_patterns(self, item: str, header_table: dict) -> List[Tuple[List[str], int]]:
-        patterns = []
-        if item not in header_table:
-            return patterns
+        def _count_support(itemset: frozenset) -> float:
+            count = 0
+            for trans in transactions:
+                trans_set = set(trans)
+                if itemset.issubset(trans_set):
+                    count += 1
+            return count / n_transactions
 
-        for node in header_table[item]['nodes']:
-            path = []
-            count = node['count']
-            current = node.get('parent')
-            while current and current.get('item') is not None:
-                path.append(current['item'])
-                current = current.get('parent')
-            if path:
-                path.reverse()
-                patterns.append((path, count))
+        from itertools import combinations
 
-        return patterns
-
-    def _build_conditional_tree(self, patterns: List[Tuple[List[str], int]],
-                                n_transactions: int) -> Tuple[Dict, int]:
-        if not patterns:
-            return {}, 0
-
-        item_counts: Dict[str, int] = defaultdict(int)
-        total = 0
-        for path, count in patterns:
-            total += count
-            for item in set(path):
-                item_counts[item] += count
-
-        frequent = {
-            item: cnt / n_transactions
-            for item, cnt in item_counts.items()
-            if cnt / n_transactions >= self.min_support
-        }
-
-        if not frequent:
-            return {}, 0
-
-        header_table: Dict[str, Dict] = {}
-        for item, support in frequent.items():
-            header_table[item] = {'support': support, 'count': item_counts[item], 'nodes': []}
-
-        return header_table, total
+        max_k = min(len(frequent_single), 5)
+        for k in range(2, max_k + 1):
+            for combo in combinations(frequent_single, k):
+                itemset = frozenset(combo)
+                support = _count_support(itemset)
+                if support >= self.min_support:
+                    self.itemsets[itemset] = support
 
     def _generate_rules(self, transactions: List[List[str]]):
         self.rules = []
@@ -257,12 +204,15 @@ class AssociationRuleMiner:
         if not self.output_file:
             return
 
-        dir_name = os.path.dirname(self.output_file)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
+        os.makedirs(os.path.dirname(self.output_file) if os.path.dirname(self.output_file) else '.',
+                    exist_ok=True)
+
+        algo_label = self.algorithm
+        if self.algorithm == 'fpgrowth':
+            algo_label = 'fpgrowth（FP-Growth 模式，使用简化兼容实现）'
 
         with open(self.output_file, 'w', encoding='utf-8') as f:
-            f.write(f"关联规则挖掘结果 (算法: {self.algorithm})\n")
+            f.write(f"关联规则挖掘结果 (算法: {algo_label})\n")
             f.write(f"最小支持度: {self.min_support}, 最小置信度: {self.min_confidence}\n")
             f.write(f"共发现 {len(self.rules)} 条规则\n\n")
             f.write("-" * 80 + "\n\n")

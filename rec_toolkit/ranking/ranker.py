@@ -30,11 +30,11 @@ class Ranker:
         if not recall_results:
             return []
 
-        merged: Dict[str, RankedResult] = {}
+        ranked = []
 
         for result in recall_results:
-            context_score = self._compute_context_score(result, context, item_profiles)
             recall_score = result.score
+            context_score = self._compute_context_score(result, context, item_profiles)
 
             if self.method == 'weighted':
                 final_score = recall_score + context_score
@@ -43,25 +43,15 @@ class Ranker:
             else:
                 final_score = recall_score
 
-            if result.item_id in merged:
-                existing = merged[result.item_id]
-                existing.final_score += final_score
-                existing.recall_score += recall_score
-                existing.context_score += context_score
-                for ch in result.channel.split(','):
-                    if ch and ch not in existing.channels:
-                        existing.channels.append(ch)
-            else:
-                merged[result.item_id] = RankedResult(
-                    item_id=result.item_id,
-                    final_score=final_score,
-                    recall_score=recall_score,
-                    context_score=context_score,
-                    channels=[ch for ch in result.channel.split(',') if ch],
-                    reason=result.reason,
-                )
+            ranked.append(RankedResult(
+                item_id=result.item_id,
+                final_score=final_score,
+                recall_score=recall_score,
+                context_score=context_score,
+                channels=result.channels if result.channels else [result.channel],
+                reason=result.reason,
+            ))
 
-        ranked = list(merged.values())
         ranked.sort(key=lambda x: x.final_score, reverse=True)
 
         return ranked

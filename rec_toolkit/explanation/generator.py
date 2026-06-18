@@ -73,6 +73,24 @@ class ReasonGenerator:
         except (KeyError, IndexError):
             return template
 
+    def generate_multi_reason(self, channels: List[str], context: Optional[Dict] = None) -> str:
+        context = context or {}
+
+        if not channels:
+            return '个性化推荐'
+
+        if len(channels) == 1:
+            return self.generate_reason(channels[0], context)
+
+        reasons = self.generate_reasons(channels, context)
+        if not reasons:
+            return '个性化推荐'
+
+        if len(reasons) == 1:
+            return reasons[0]
+
+        return '，同时'.join(reasons)
+
     def generate_reasons(self, channels: List[str], context: Optional[Dict] = None) -> List[str]:
         reasons = []
         for channel in channels:
